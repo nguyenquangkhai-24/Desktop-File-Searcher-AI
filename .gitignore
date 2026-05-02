@@ -1,0 +1,8 @@
+env/
+__pycache__/
+file_index.db
+.cache/
+*.pyc
+.antigravity_docs/
+python_portable/
+poppler/
