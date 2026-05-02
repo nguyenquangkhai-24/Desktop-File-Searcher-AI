@@ -1,0 +1,5 @@
+env/
+__pycache__/
+file_index.db
+.cache/
+*.pyc

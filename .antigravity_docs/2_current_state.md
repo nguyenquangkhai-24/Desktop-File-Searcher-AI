@@ -1,0 +1,2 @@
+- Tái cấu trúc lại dự án. Chuyển từ ứng dụng Web sang ứng dụng Desktop (Tkinter).
+- Mã nguồn cũ (nếu có) không còn giá trị. Bắt đầu viết lại từ đầu.
