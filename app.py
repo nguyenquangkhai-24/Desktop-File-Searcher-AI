@@ -1,4 +1,6 @@
 import os
+import sys
+import subprocess
 import threading
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
@@ -7,18 +9,6 @@ from io import BytesIO
 import sqlite3
 import gc
 import time
-
-import PyPDF2
-from pdf2image import convert_from_path, pdfinfo_from_path
-import easyocr
-import numpy as np
-from PIL import Image
-import docx
-from pptx import Presentation
-import openpyxl
-
-import torch
-from transformers import pipeline
 
 import pystray
 from PIL import Image, ImageDraw
@@ -59,8 +49,7 @@ class DocumentEventHandler(FileSystemEventHandler):
 # ==========================================
 # CẤU HÌNH TỐI ƯU CUDNN VÀ AI (LAZY LOADING)
 # ==========================================
-torch.backends.cudnn.benchmark = True
-use_gpu = torch.cuda.is_available()
+use_gpu = False
 
 classifier = None
 ocr_reader = None
@@ -69,10 +58,17 @@ ai_initialized = False
 CANDIDATE_LABELS = ["Toán học", "Lập trình", "Kiến thức Đại cương", "Khác"]
 
 def init_ai_models(status_callback=None):
-    global classifier, ocr_reader, ai_initialized
+    global classifier, ocr_reader, ai_initialized, use_gpu
     if ai_initialized:
         return
         
+    import torch
+    from transformers import pipeline
+    import easyocr
+    
+    torch.backends.cudnn.benchmark = True
+    use_gpu = torch.cuda.is_available()
+
     if status_callback:
         status_callback("Trạng thái: Đang nạp mô hình NLP Zero-Shot...")
     print("Đang khởi tạo mô hình NLP Zero-Shot (FP16)... Vui lòng đợi.")
@@ -160,12 +156,12 @@ def search_db(keyword, topic):
         cursor = conn.cursor()
         if topic == "Tất cả":
             cursor.execute('''
-                SELECT filepath, content FROM documents
+                SELECT filepath, content, topic FROM documents
                 WHERE content LIKE ? OR filepath LIKE ?
             ''', (f'%{keyword}%', f'%{keyword}%'))
         else:
             cursor.execute('''
-                SELECT filepath, content FROM documents
+                SELECT filepath, content, topic FROM documents
                 WHERE (content LIKE ? OR filepath LIKE ?) AND topic = ?
             ''', (f'%{keyword}%', f'%{keyword}%', topic))
         results = cursor.fetchall()
@@ -179,6 +175,10 @@ def search_db(keyword, topic):
 # TRÍCH XUẤT VĂN BẢN (I/O CPU)
 # ==========================================
 def extract_text_pdf(filepath):
+    import PyPDF2
+    from pdf2image import convert_from_path, pdfinfo_from_path
+    import numpy as np
+    import torch
     text = []
     try:
         reader = PyPDF2.PdfReader(filepath)
@@ -231,6 +231,8 @@ def extract_text_pdf(filepath):
     return "\n".join(text)
 
 def extract_text_docx(filepath):
+    import docx
+    import torch
     text = []
     try:
         doc = docx.Document(filepath)
@@ -267,6 +269,7 @@ def extract_text_docx(filepath):
     return "\n".join(text)
 
 def extract_text_pptx(filepath):
+    from pptx import Presentation
     text = []
     try:
         prs = Presentation(filepath)
@@ -279,6 +282,7 @@ def extract_text_pptx(filepath):
     return "\n".join(text)
 
 def extract_text_excel(filepath):
+    import openpyxl
     text = []
     try:
         wb = openpyxl.load_workbook(filepath, data_only=True)
@@ -295,6 +299,7 @@ def extract_text_excel(filepath):
 # PHÂN LOẠI CHỦ ĐỀ AI (GPU)
 # ==========================================
 def classify_text(text):
+    import torch
     if not classifier or not text.strip():
         return "Khác"
         
@@ -371,7 +376,7 @@ class App:
         tk.Label(frame_top, text="Thư mục/Ổ đĩa:").grid(row=0, column=0, sticky=tk.W, pady=5)
         self.entry_dir = tk.Entry(frame_top, width=60)
         self.entry_dir.grid(row=0, column=1, padx=5, pady=5)
-        self.entry_dir.insert(0, "D:\\")
+        self.entry_dir.insert(0, os.path.expanduser('~') if sys.platform == 'darwin' else "D:\\")
         
         btn_browse = tk.Button(frame_top, text="Chọn Thư Mục", command=self.browse_dir)
         btn_browse.grid(row=0, column=2, padx=5, pady=5)
@@ -411,11 +416,13 @@ class App:
         frame_list = tk.Frame(self.paned_window)
         self.paned_window.add(frame_list, minsize=150)
         
-        self.tree = ttk.Treeview(frame_list, columns=("Path", "Snippet"), show="headings")
+        self.tree = ttk.Treeview(frame_list, columns=("Path", "Snippet", "Topic"), show="headings")
         self.tree.heading("Path", text="Đường dẫn File (Nhấp đúp để mở)")
         self.tree.heading("Snippet", text="Trích đoạn chứa từ khóa")
+        self.tree.heading("Topic", text="Chủ đề")
         self.tree.column("Path", width=300)
-        self.tree.column("Snippet", width=500)
+        self.tree.column("Snippet", width=400)
+        self.tree.column("Topic", width=100)
         self.tree.pack(fill=tk.BOTH, expand=True, side=tk.LEFT)
         
         scrollbar_list = ttk.Scrollbar(frame_list, orient=tk.VERTICAL, command=self.tree.yview)
@@ -494,7 +501,10 @@ class App:
         if selected:
             filepath = self.tree.item(selected[0], "values")[0]
             try:
-                os.startfile(filepath)
+                if sys.platform == 'darwin':
+                    subprocess.call(['open', filepath])
+                else:
+                    os.startfile(filepath)
             except Exception as e:
                 messagebox.showerror("Lỗi", f"Không thể mở file: {e}")
 
@@ -670,7 +680,7 @@ class App:
         
         results = search_db(keyword, topic)
         
-        for filepath, content in results:
+        for filepath, content, item_topic in results:
             self.current_search_results[filepath] = content
             
             content_lower = content.lower()
@@ -686,7 +696,7 @@ class App:
             else:
                 snippet = "Không tìm thấy đoạn chứa từ khóa trực tiếp."
                 
-            self.tree.insert("", tk.END, values=(filepath, snippet))
+            self.tree.insert("", tk.END, values=(filepath, snippet, item_topic))
             
         self.lbl_search_status.config(text=f"Tìm thấy {len(results)} kết quả.")
 

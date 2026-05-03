@@ -4,7 +4,7 @@ title Khoi dong Ung dung AI
 :: 1. Dịch chuyển về thư mục chứa file .bat
 cd /d "%~dp0"
 
-:: 2. Kiểm tra file thực thi pythonw.exe (Dùng để chạy ẩn console)
+:: 2. Kiểm tra file thực thi pythonw.exe
 if not exist ".\python_portable\pythonw.exe" (
     color 0C
     echo ========================================================
@@ -14,13 +14,9 @@ if not exist ".\python_portable\pythonw.exe" (
     exit /b
 )
 
-:: 3. Khởi chạy ứng dụng bằng pythonw để không hiện cửa sổ đen
+:: 3. Khởi chạy ứng dụng chạy ẩn và ghi luồng lỗi (stderr) ra file crash_log.txt
 echo Dang khoi dong ung dung...
-.\python_portable\pythonw.exe app.py
+.\python_portable\pythonw.exe app.py 2> crash_log.txt
 
-:: Nếu có lỗi phát sinh sau khi chạy, lệnh pause dưới đây sẽ giúp bạn nhìn thấy lỗi
-if %errorlevel% neq 0 (
-    echo.
-    echo [LOI] Ung dung gap su co khi khoi dong.
-    pause
-)
+:: Mặc định cửa sổ sẽ tự đóng do pythonw chạy ngầm.
+:: Bất kỳ lỗi crash ngầm nào (như thiếu AVX trên máy ảo) sẽ được lưu vào crash_log.txt
