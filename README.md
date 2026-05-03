@@ -24,3 +24,7 @@ Phiên bản **Portable (Độc lập)** này đã tích hợp sẵn toàn bộ 
 - **Tab 1 (Lập chỉ mục):** Chọn thư mục chứa tài liệu của bạn và bấm "Bắt đầu Quét". Hệ thống sẽ nạp siêu tốc metadata và mở khóa tìm kiếm ngay lập tức.
 - **Chế độ Chạy Ngầm:** Khi bấm nút "X" ở góc trên bên phải, phần mềm **không tắt** mà sẽ thu nhỏ xuống khay hệ thống (System Tray - góc dưới bên phải màn hình). Để thoát hoàn toàn, click chuột phải vào icon ứng dụng và chọn "Thoát".
 - **Tab 2 (Tìm kiếm):** Gõ từ khóa, chọn chủ đề và bấm Tìm kiếm. Nhấp đúp chuột vào kết quả để mở hẳn file gốc bằng phần mềm mặc định của máy.
+## 🛠️ Xử lý sự cố (Troubleshooting)
+Phần mềm tích hợp Trí tuệ Nhân tạo nên yêu cầu phần cứng (CPU) phải hỗ trợ tập lệnh tập lệnh cơ bản (AVX). 
+- **Lỗi không hiện giao diện (Crash ngầm):** Nếu bạn nhấp đúp vào file `.bat` mà phần mềm không mở lên, nguyên nhân thường do bạn đang chạy trên **Máy ảo (VM)** chưa bật tính năng truyền AVX (Passthrough), hoặc thiếu thư viện C++ của Windows.
+- **Cách khắc phục/Báo lỗi:** Hãy mở file `crash_log.txt` nằm trong cùng thư mục (nếu có) để xem thông báo lỗi chi tiết, hoặc chạy file `debug_vm.bat` để hiển thị cửa sổ Command Prompt chẩn đoán lỗi. Gửi log này cho nhà phát triển để được hỗ trợ.
