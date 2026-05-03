@@ -1,4 +1,9 @@
-import os
+import sys
+
+with open("app.py", "r", encoding="utf-8") as f:
+    lines = f.readlines()
+
+new_imports = """import os
 import sys
 import subprocess
 import threading
@@ -14,386 +19,9 @@ import time
 # Config CTK
 ctk.set_appearance_mode("System")
 ctk.set_default_color_theme("blue")
+"""
 
-# Config CTK
-ctk.set_appearance_mode("System")
-ctk.set_default_color_theme("blue")
-import pystray
-from PIL import Image, ImageDraw
-from watchdog.observers import Observer
-from watchdog.events import FileSystemEventHandler
-
-# ==========================================
-# WATCHDOG EVENT HANDLER
-# ==========================================
-class DocumentEventHandler(FileSystemEventHandler):
-    def __init__(self, app_instance):
-        self.app = app_instance
-        self.allowed_extensions = {".pdf", ".docx", ".pptx", ".xlsx"}
-
-    def on_created(self, event):
-        self.process_event(event)
-
-    def on_modified(self, event):
-        self.process_event(event)
-        
-    def process_event(self, event):
-        if event.is_directory:
-            return
-        filepath = event.src_path
-        ext = os.path.splitext(filepath)[1].lower()
-        if ext in self.allowed_extensions:
-            try:
-                os_mtime = os.path.getmtime(filepath)
-                insert_or_update_document(filepath, "", "Đang chờ", os_mtime)
-                
-                # Tự động gắp file "Đang chờ"
-                if not getattr(self.app, 'is_indexing', False):
-                    self.app.is_indexing = True
-                    threading.Thread(target=self.app.background_processing_worker, daemon=True).start()
-            except Exception as e:
-                print(f"Watchdog lỗi xử lý file: {e}")
-
-# ==========================================
-# CẤU HÌNH TỐI ƯU CUDNN VÀ AI (LAZY LOADING)
-# ==========================================
-use_gpu = False
-
-classifier = None
-ocr_reader = None
-ai_initialized = False
-
-CANDIDATE_LABELS = ["Toán học", "Lập trình", "Kiến thức Đại cương", "Khác"]
-
-def init_ai_models(status_callback=None):
-    global classifier, ocr_reader, ai_initialized, use_gpu
-    if ai_initialized:
-        return
-        
-    import torch
-    from transformers import pipeline
-    import easyocr
-    
-    torch.backends.cudnn.benchmark = True
-    use_gpu = torch.cuda.is_available()
-
-    if status_callback:
-        status_callback("Trạng thái: Đang nạp mô hình NLP Zero-Shot...")
-    print("Đang khởi tạo mô hình NLP Zero-Shot (FP16)... Vui lòng đợi.")
-    try:
-        classifier = pipeline(
-            "zero-shot-classification", 
-            model="MoritzLaurer/mDeBERTa-v3-base-mnli-xnli", 
-            device=0 if use_gpu else -1, 
-            torch_dtype=torch.float16 if use_gpu else torch.float32
-        )
-    except Exception as e:
-        print(f"Lỗi khởi tạo mô hình AI: {e}")
-        classifier = None
-
-    if status_callback:
-        status_callback("Trạng thái: Đang nạp EasyOCR...")
-    try:
-        ocr_reader = easyocr.Reader(['vi', 'en'], gpu=use_gpu)
-    except Exception as e:
-        print(f"Lỗi khởi tạo EasyOCR: {e}")
-        ocr_reader = None
-        
-    ai_initialized = True
-
-# ==========================================
-# CƠ SỞ DỮ LIỆU SQLITE
-# ==========================================
-DB_PATH = 'file_index.db'
-
-def init_db():
-    try:
-        conn = sqlite3.connect(DB_PATH, timeout=10)
-        cursor = conn.cursor()
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS documents (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                filepath TEXT UNIQUE,
-                content TEXT,
-                topic TEXT,
-                last_modified REAL
-            )
-        ''')
-        try:
-            cursor.execute("ALTER TABLE documents ADD COLUMN last_modified REAL")
-        except sqlite3.OperationalError:
-            pass # Cột đã tồn tại
-            
-        # FTS5 Virtual Table
-        cursor.execute('''
-            CREATE VIRTUAL TABLE IF NOT EXISTS documents_fts 
-            USING fts5(content, tokenize="unicode61");
-        ''')
-        
-        # Migration logic cho phiên bản cũ
-        cursor.execute("SELECT COUNT(*) FROM documents_fts")
-        if cursor.fetchone()[0] == 0:
-            cursor.execute('''
-                INSERT INTO documents_fts (rowid, content)
-                SELECT id, content FROM documents 
-                WHERE content IS NOT NULL AND content != '';
-            ''')
-            
-        conn.commit()
-        conn.close()
-    except Exception as e:
-        print(f"Lỗi tạo DB: {e}")
-
-def get_db_mtime(filepath):
-    try:
-        conn = sqlite3.connect(DB_PATH, timeout=10)
-        cursor = conn.cursor()
-        cursor.execute("SELECT last_modified FROM documents WHERE filepath = ?", (filepath,))
-        row = cursor.fetchone()
-        conn.close()
-        if row and row[0]:
-            return row[0]
-        return 0.0
-    except:
-        return 0.0
-
-def insert_or_update_document(filepath, content, topic, mtime):
-    try:
-        conn = sqlite3.connect(DB_PATH, timeout=10)
-        cursor = conn.cursor()
-        cursor.execute('''
-            INSERT INTO documents (filepath, content, topic, last_modified)
-            VALUES (?, ?, ?, ?)
-            ON CONFLICT(filepath) DO UPDATE SET
-            content=excluded.content,
-            topic=excluded.topic,
-            last_modified=excluded.last_modified
-        ''', (filepath, content, topic, mtime))
-        
-        # Lấy ID vừa insert/update để đồng bộ sang bảng FTS
-        cursor.execute("SELECT id FROM documents WHERE filepath = ?", (filepath,))
-        row = cursor.fetchone()
-        if row:
-            doc_id = row[0]
-            cursor.execute('''
-                INSERT OR REPLACE INTO documents_fts (rowid, content)
-                VALUES (?, ?)
-            ''', (doc_id, content))
-            
-        conn.commit()
-        conn.close()
-    except Exception as e:
-        print(f"Lỗi lưu DB cho file {filepath}: {e}")
-
-def search_db(keyword, topic):
-    try:
-        conn = sqlite3.connect(DB_PATH, timeout=10)
-        cursor = conn.cursor()
-        
-        # Xử lý keyword cho FTS MATCH (Tìm cụm từ chính xác)
-        sanitized_kw = keyword.replace('"', '""')
-        match_query = f'"{sanitized_kw}"'
-        
-        if topic == "Tất cả":
-            cursor.execute('''
-                SELECT d.filepath, d.content, d.topic, snippet(documents_fts, 0, '<b>', '</b>', '...', 15)
-                FROM documents_fts f
-                JOIN documents d ON f.rowid = d.id
-                WHERE f.documents_fts MATCH ?
-                UNION
-                SELECT filepath, content, topic, NULL
-                FROM documents
-                WHERE filepath LIKE ? AND id NOT IN (SELECT rowid FROM documents_fts WHERE documents_fts MATCH ?)
-            ''', (match_query, f'%{keyword}%', match_query))
-        else:
-            cursor.execute('''
-                SELECT d.filepath, d.content, d.topic, snippet(documents_fts, 0, '<b>', '</b>', '...', 15)
-                FROM documents_fts f
-                JOIN documents d ON f.rowid = d.id
-                WHERE f.documents_fts MATCH ? AND d.topic = ?
-                UNION
-                SELECT filepath, content, topic, NULL
-                FROM documents
-                WHERE filepath LIKE ? AND id NOT IN (SELECT rowid FROM documents_fts WHERE documents_fts MATCH ?) AND topic = ?
-            ''', (match_query, topic, f'%{keyword}%', match_query, topic))
-        results = cursor.fetchall()
-        conn.close()
-        return results
-    except Exception as e:
-        print(f"Lỗi truy vấn DB: {e}")
-        return []
-
-# ==========================================
-# TRÍCH XUẤT VĂN BẢN (I/O CPU)
-# ==========================================
-def extract_text_pdf(filepath):
-    import PyPDF2
-    from pdf2image import convert_from_path, pdfinfo_from_path
-    import numpy as np
-    import torch
-    text = []
-    try:
-        reader = PyPDF2.PdfReader(filepath)
-        for page in reader.pages:
-            extracted = page.extract_text()
-            if extracted:
-                text.append(extracted)
-    except Exception as e:
-        pass
-        
-    combined_text = "\n".join(text)
-    if len(combined_text) > 50:
-        return combined_text
-        
-    try:
-        current_dir = os.path.dirname(os.path.abspath(__file__))
-        if sys.platform == 'darwin':
-            poppler_relative_path = None
-        else:
-            poppler_relative_path = os.path.join(current_dir, 'poppler', 'Library', 'bin')
-        
-        info = pdfinfo_from_path(filepath, poppler_path=poppler_relative_path)
-        total_pages = info.get("Pages", 0)
-        
-        batch_size = 3
-        for start_page in range(1, total_pages + 1, batch_size):
-            end_page = min(start_page + batch_size - 1, total_pages)
-            images = convert_from_path(
-                filepath, 
-                first_page=start_page, 
-                last_page=end_page, 
-                poppler_path=poppler_relative_path
-            )
-            
-            for img in images:
-                if ocr_reader:
-                    try:
-                        img_array = np.array(img)
-                        ocr_result = ocr_reader.readtext(img_array, detail=0)
-                        if ocr_result:
-                            text.append("\n".join(ocr_result))
-                    except Exception as e:
-                        print("Bỏ qua OCR do thiếu thư viện")
-            
-            del images
-            if use_gpu:
-                torch.cuda.empty_cache()
-            gc.collect()
-
-    except Exception as e:
-        print("Bỏ qua OCR do thiếu thư viện")
-        
-    return "\n".join(text)
-
-def extract_text_docx(filepath):
-    import docx
-    import torch
-    text = []
-    try:
-        doc = docx.Document(filepath)
-        for para in doc.paragraphs:
-            if para.text:
-                text.append(para.text)
-    except Exception as e:
-        pass
-
-    try:
-        with zipfile.ZipFile(filepath, 'r') as archive:
-            for item in archive.namelist():
-                if item.startswith('word/media/'):
-                    try:
-                        image_data = archive.read(item)
-                        if ocr_reader:
-                            try:
-                                ocr_result = ocr_reader.readtext(image_data, detail=0)
-                                if ocr_result:
-                                    text.append("\n".join(ocr_result))
-                            except Exception as e:
-                                print("Bỏ qua OCR do thiếu thư viện")
-                        
-                        del image_data
-                        if use_gpu:
-                            torch.cuda.empty_cache()
-                        gc.collect()
-                        
-                    except Exception as e:
-                        pass
-    except Exception as e:
-        pass
-        
-    return "\n".join(text)
-
-def extract_text_pptx(filepath):
-    from pptx import Presentation
-    text = []
-    try:
-        prs = Presentation(filepath)
-        for slide in prs.slides:
-            for shape in slide.shapes:
-                if hasattr(shape, "text") and shape.text:
-                    text.append(shape.text)
-    except Exception as e:
-        pass
-    return "\n".join(text)
-
-def extract_text_excel(filepath):
-    import openpyxl
-    text = []
-    try:
-        wb = openpyxl.load_workbook(filepath, data_only=True)
-        for sheet in wb.worksheets:
-            for row in sheet.iter_rows(values_only=True):
-                for cell in row:
-                    if cell is not None:
-                        text.append(str(cell))
-    except Exception as e:
-        pass
-    return " ".join(text)
-
-# ==========================================
-# PHÂN LOẠI CHỦ ĐỀ AI (GPU)
-# ==========================================
-def classify_text(text):
-    import torch
-    if not classifier or not text.strip():
-        return "Khác"
-        
-    try:
-        # Cắt text thành các chunks nhỏ (khoảng 1000 ký tự một chunk)
-        chunk_size = 1000
-        text_chunks = [text[i:i+chunk_size] for i in range(0, len(text), chunk_size)]
-        
-        # Chỉ lấy tối đa 8 chunks đầu tiên để tăng tốc độ phân loại
-        text_chunks = text_chunks[:8]
-        
-        if not text_chunks:
-            return "Khác"
-
-        # Phân loại theo batch (tối ưu tốc độ) -> batch_size=8
-        results = classifier(text_chunks, CANDIDATE_LABELS, batch_size=8)
-        
-        topic_scores = {label: 0 for label in CANDIDATE_LABELS}
-        
-        if isinstance(results, dict):
-            results = [results]
-            
-        for res in results:
-            for label, score in zip(res['labels'], res['scores']):
-                topic_scores[label] += score
-                
-        best_topic = max(topic_scores, key=topic_scores.get)
-        return best_topic
-        
-    except torch.cuda.OutOfMemoryError:
-        print("Lỗi tràn VRAM GPU (OOM)! Đang tự động giải phóng bộ nhớ.")
-        if use_gpu:
-            torch.cuda.empty_cache()
-        return "Khác"
-    except Exception as e:
-        print(f"Lỗi AI phân loại: {e}")
-        return "Khác"
-
-# ==========================================
+new_app_class = """# ==========================================
 # GIAO DIỆN CHÍNH (CUSTOMTKINTER)
 # ==========================================
 class App:
@@ -448,7 +76,7 @@ class App:
         ctk.CTkLabel(frame_top, text="Thư mục/Ổ đĩa:").grid(row=0, column=0, sticky=tk.W, pady=5, padx=5)
         self.entry_dir = ctk.CTkEntry(frame_top, width=450)
         self.entry_dir.grid(row=0, column=1, padx=5, pady=5)
-        self.entry_dir.insert(0, os.path.expanduser('~') if sys.platform == 'darwin' else "D:\\")
+        self.entry_dir.insert(0, os.path.expanduser('~') if sys.platform == 'darwin' else "D:\\\\")
         
         btn_browse = ctk.CTkButton(frame_top, text="Chọn Thư Mục", command=self.browse_dir, width=120)
         btn_browse.grid(row=0, column=2, padx=5, pady=5)
@@ -667,7 +295,7 @@ class App:
     def phase1_complete(self, processed_count, skipped_count):
         self.btn_index.configure(state=tk.NORMAL)
         self.lbl_index_status.configure(text=f"Hoàn tất quét siêu tốc! Đang khởi động đọc ngầm...")
-        messagebox.showinfo("Thành công", f"Quá trình nạp Metadata hoàn tất.\n\n- File mới/cập nhật: {processed_count}\n- File đã bỏ qua: {skipped_count}\n\nĐã mở khóa tìm kiếm theo tên. Hệ thống đang tiến hành đọc nội dung ngầm.")
+        messagebox.showinfo("Thành công", f"Quá trình nạp Metadata hoàn tất.\\n\\n- File mới/cập nhật: {processed_count}\\n- File đã bỏ qua: {skipped_count}\\n\\nĐã mở khóa tìm kiếm theo tên. Hệ thống đang tiến hành đọc nội dung ngầm.")
         threading.Thread(target=self.background_processing_worker, daemon=True).start()
 
     def background_processing_worker(self):
@@ -754,7 +382,7 @@ class App:
             
             if snippet_text:
                 # Làm sạch HTML tags
-                clean_snippet = snippet_text.replace("\n", " ")
+                clean_snippet = snippet_text.replace("\\n", " ")
                 clean_snippet = clean_snippet.replace("<b>", "").replace("</b>", "")
                 snippet = clean_snippet
             else:
@@ -763,7 +391,7 @@ class App:
                 if idx != -1:
                     start_idx = max(0, idx - 40)
                     end_idx = min(len(content), idx + len(keyword) + 100)
-                    snippet = content[start_idx:end_idx].replace("\n", " ")
+                    snippet = content[start_idx:end_idx].replace("\\n", " ")
                     if start_idx > 0:
                         snippet = "..." + snippet
                     if end_idx < len(content):
@@ -779,3 +407,20 @@ if __name__ == "__main__":
     root = ctk.CTk()
     app = App(root)
     root.mainloop()
+"""
+
+# Tìm dòng chứa # ========================================== GIAO DIỆN CHÍNH
+split_idx = -1
+for i, line in enumerate(lines):
+    if "# GIAO DIỆN CHÍNH" in line:
+        split_idx = i - 1
+        break
+
+if split_idx != -1:
+    middle_code = "".join(lines[12:split_idx])
+    final_content = new_imports + middle_code + new_app_class
+    with open("app.py", "w", encoding="utf-8") as f:
+        f.write(final_content)
+    print("Successfully updated app.py")
+else:
+    print("Could not find split index!")
